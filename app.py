@@ -1,9 +1,8 @@
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 import gzip
-import io
 import os
 import threading
 import time
@@ -26,7 +25,6 @@ EPG_REFRESH_SECONDS = int(os.getenv("EPG_REFRESH_SECONDS", "21600"))
 epg_lock = threading.Lock()
 epg_cache = {}
 epg_last_updated = None
-
 
 CHANNEL_MAP = {
     "ČT1": "ct1",
@@ -61,6 +59,7 @@ CHANNEL_MAP = {
 def _parse_xmltv_dt(value: str):
     if not value:
         return None
+
     raw = value.strip()
     parts = raw.split()
     stamp = parts[0]
@@ -99,7 +98,6 @@ def _load_epg():
             raw = gzip.decompress(raw)
 
         root = ET.fromstring(raw)
-
         parsed = {}
 
         for programme in root.findall("programme"):
@@ -148,6 +146,7 @@ def _epg_worker():
 
 @app.on_event("startup")
 def startup():
+    _load_epg()
     thread = threading.Thread(target=_epg_worker, daemon=True)
     thread.start()
 
@@ -155,6 +154,23 @@ def startup():
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
+@app.get("/health")
+def health():
+    with epg_lock:
+        loaded = bool(epg_cache)
+        updated = epg_last_updated
+        channel_count = len(epg_cache)
+
+    return {
+        "status": "ok",
+        "epgLoaded": loaded,
+        "lastUpdated": updated,
+        "channelCount": channel_count,
+        "knownChannels": len(CHANNEL_MAP),
+        "refreshSeconds": EPG_REFRESH_SECONDS,
+    }
 
 
 @app.get("/proxy")
@@ -177,7 +193,9 @@ def proxy(url: str):
                 continue
 
             absolute = urljoin(url, line.strip())
-            lines.append(f"/proxy?url={absolute}")
+            lines.append(
+                "/proxy?url=" + quote(absolute, safe="")
+            )
 
         return Response(
             "\n".join(lines),
@@ -194,30 +212,31 @@ def proxy(url: str):
 
 @app.get("/guide")
 def guide():
-    now = datetime.now(timezone.utc).timestamp()
+    now_ts = datetime.now(timezone.utc).timestamp()
     out = {}
 
     with epg_lock:
         cache = dict(epg_cache)
         updated = epg_last_updated
 
-    for name, epg_id in CHANNEL_MAP.items():
+    for display_name, epg_id in CHANNEL_MAP.items():
         items = cache.get(epg_id, [])
         current = None
         next_item = None
 
         for i, item in enumerate(items):
-            if item["start_ts"] <= now < item["stop_ts"]:
+            if item["start_ts"] <= now_ts < item["stop_ts"]:
                 current = item
                 if i + 1 < len(items):
                     next_item = items[i + 1]
                 break
-            if item["start_ts"] > now:
+            if item["start_ts"] > now_ts:
                 next_item = item
                 break
 
-        out[name] = {
+        out[epg_id] = {
             "epgId": epg_id,
+            "displayName": display_name,
             "now": None if not current else {
                 "title": current["title"],
                 "desc": current["desc"],
@@ -243,6 +262,7 @@ def now(channel: str):
     guide_data = guide()
     return guide_data["channels"].get(channel, {
         "epgId": None,
+        "displayName": None,
         "now": None,
         "next": None,
     })
